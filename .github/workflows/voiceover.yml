@@ -1,0 +1,102 @@
+name: VoiceOver transcripts (preferenceconsulting.com)
+
+on:
+  workflow_dispatch:
+    inputs:
+      read_scale:
+        description: "Multiplier for the linear read-through length (1 = default per page)"
+        default: "1"
+        required: false
+      pages:
+        description: "all, or a comma-separated list of pages (home,about,realitysync,halo-project,it-solutions,contact,virtual-lighthouse,preserving-florida,ccfm,bay-of-pigs,cape-florida,category)"
+        default: "all"
+        required: false
+      mode:
+        description: "Transcript header line: the state of the site that is tested"
+        default: "real session on the published site as it was on the session date"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          WANT: ${{ inputs.pages || 'all' }}
+        run: |
+          # Starts 30 s apart, so the runners load their pages at different times (GET only, 1 request per second each).
+          all='[{"page":"home","delay":0},{"page":"about","delay":30},{"page":"realitysync","delay":60},{"page":"halo-project","delay":90},{"page":"it-solutions","delay":120},{"page":"contact","delay":150},{"page":"virtual-lighthouse","delay":180},{"page":"preserving-florida","delay":210},{"page":"ccfm","delay":240},{"page":"bay-of-pigs","delay":270},{"page":"cape-florida","delay":300},{"page":"category","delay":330}]'
+          m=$(echo "$all" | jq -c --arg w "$WANT" 'if $w == "all" then . else map(select(. as $j | ("," + $w + ",") | contains("," + $j.page + ","))) end')
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"; echo "$m"
+
+  voiceover:
+    needs: plan
+    name: VoiceOver / webkit / ${{ matrix.page }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # One macOS runner per page so the templates run in parallel (VoiceOver allows one session per machine).
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      VO_PAGES: ${{ matrix.page }}
+      VO_READ_SCALE: ${{ inputs.read_scale }}
+      VO_MODE: ${{ inputs.mode }}
+      RUNNER_OS_LABEL: macos-15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      # Accessibility permissions in the user TCC.db, AppleScript control of VoiceOver, welcome dialog suppressed.
+      # Some runners refuse the first keystrokes ("osascript is not allowed to send keystrokes") while the new
+      # permissions settle, so the setup is tried up to three times.
+      - name: Prepare macOS for VoiceOver automation
+        run: |
+          for i in 1 2 3; do
+            if npx -y @guidepup/setup@0.29.1 setup --ci; then exit 0; fi
+            echo "guidepup setup attempt $i failed; trying again in 30 s"
+            sleep 30
+          done
+          exit 1
+
+      # The runner image maps the bottom-right hot corner to Quick Note, which interrupts VoiceOver read-throughs.
+      - name: Disable macOS hot corners (Quick Note)
+        run: |
+          for c in tl tr bl br; do defaults write com.apple.dock "wvous-$c-corner" -int 1; defaults write com.apple.dock "wvous-$c-modifier" -int 0; done
+          killall Dock || true
+
+      - name: Install npm dependencies
+        run: npm ci --no-audit --no-fund --no-progress
+
+      - name: Install Playwright browser
+        run: npx playwright install webkit
+
+      - name: Install Guidepup VoiceOver assets
+        run: npx -y @guidepup/setup@0.29.1 install
+
+      # Staggered start so the parallel runners do not request the site in the same second.
+      - name: Stagger start
+        run: sleep ${{ matrix.delay }}
+
+      - name: Run the real VoiceOver session and write the transcript
+        run: npx playwright test --project=webkit
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: voiceover-webkit-${{ matrix.page }}
+          if-no-files-found: warn
+          path: |
+            transcripts/**
+            test-results/**
+            playwright-report/**
