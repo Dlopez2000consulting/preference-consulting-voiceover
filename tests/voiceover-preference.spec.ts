@@ -55,6 +55,11 @@ test.describe("VoiceOver — preferenceconsulting.com", () => {
       const url = `${ORIGIN}${pg.path}`;
       await page.goto(url, { waitUntil: "load" });
       await page.locator("body").waitFor();
+      // Hostinger's bot protection first serves "Checking your browser... Please wait for up to 5 seconds..." to a
+      // browser without its cookies, then reloads into the page. Wait for the real page so the transcript is of it.
+      const challenge = () => page.evaluate(() => /Please wait for up to 5 seconds/i.test(document.body?.innerText || "")).catch(() => true);
+      for (let i = 0; i < 60 && (await challenge()); i++) { await page.waitForTimeout(1000); await page.waitForLoadState("load").catch(() => {}); }
+      if (await challenge()) throw new Error("bot-protection interstitial did not clear; transcript would not be of the page");
       await page.waitForTimeout(4000);
 
       await voiceOver.navigateToWebContent();
